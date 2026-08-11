@@ -21,6 +21,8 @@
 #include "Consoles.h"
 #include "BaseSolution.h"
 #include "Uart.h"
+#include "LineEditor.h"
+#include "MessageQueue.h"
 
 #include "FreeRTOS.h"
 #include "task.h"
@@ -29,8 +31,8 @@
 #include "semphr.h"
 
 #include <functional>
-#include <set>
 #include <cmath>
+#include <map>
 
 #include <sys/types.h>
 #include <sys/stat.h>
@@ -38,6 +40,7 @@
 #include <iostream>
 #include <fstream>
 #include <malloc.h>
+
 
 #define HELP(m) if(params == "-h") { os.printf("%s\n", m); return true; }
 
@@ -97,6 +100,8 @@ bool CommandShell::initialize()
     THEDISPATCHER->add_handler( "flash", std::bind( &CommandShell::flash_cmd, this, _1, _2) );
     THEDISPATCHER->add_handler( "msc", std::bind( &CommandShell::msc_cmd, this, _1, _2) );
     THEDISPATCHER->add_handler( "echo", std::bind( &CommandShell::echo_cmd, this, _1, _2) );
+    THEDISPATCHER->add_handler( "o", std::bind( &CommandShell::subroutines_cmd, this, _1, _2) );
+    THEDISPATCHER->add_handler( "le", std::bind( &CommandShell::line_editor_cmd, this, _1, _2) );
 
     THEDISPATCHER->add_handler(Dispatcher::MCODE_HANDLER, 20, std::bind(&CommandShell::m20_cmd, this, _1, _2));
     THEDISPATCHER->add_handler(Dispatcher::MCODE_HANDLER, 115, std::bind(&CommandShell::m115_cmd, this, _1, _2));
@@ -1304,7 +1309,7 @@ bool CommandShell::jog_cmd(std::string& params, OutputStream& os)
 
         if(ax == 'E') {
             // find out which is the active extruder
-            is_extruder= Robot::getInstance()->get_active_extruder();
+            is_extruder = Robot::getInstance()->get_active_extruder();
             if(is_extruder > 0) ax = 'A' + is_extruder - 3;
         }
 
@@ -1386,7 +1391,7 @@ bool CommandShell::jog_cmd(std::string& params, OutputStream& os)
         }
 
         // calculate minimum distance to travel to accomodate acceleration and feedrate
-        float d = (fr * fr) / (2*acc); // distance required to fully accelerate to feedrate in mm (d = v*v / 2*a)
+        float d = (fr * fr) / (2 * acc); // distance required to fully accelerate to feedrate in mm (d = v*v / 2*a)
         d = std::max(d, 0.3333F); // get minimum distance to move being 1mm overall so 0.3333mm for each segment
 
         // we need to check if the feedrate is too slow, for continuous jog if it takes over 5 seconds it is too slow
@@ -1683,12 +1688,13 @@ bool CommandShell::download_cmd(std::string& params, OutputStream& os)
 
     os.fast_capture_fnc = [&fp, &state, xSemaphore, file_size](char *buf, size_t len) {
         // note this is being run in the Comms thread
-        if(state < 0 || state >= file_size) return true; // we are in an error state or done
+        if(state < 0 || state >= file_size) return false; // we are in an error state or done
 
         if(fwrite(buf, 1, len, fp) != len) {
             state = -1;
             printf("DEBUG: fast download fwrite failed\n");
             xSemaphoreGive(xSemaphore);
+            return false;
         } else {
             state += len;
             if(state >= file_size) {
@@ -1710,6 +1716,8 @@ bool CommandShell::download_cmd(std::string& params, OutputStream& os)
         printf("DEBUG: fast download timed out\n");
         state = -2;
         errno = ETIMEDOUT;
+        // this could potentially cause a crash due to a race condition
+        os.fast_capture_fnc = nullptr;
     }
 
     os.printf(state <= 0 ? "FAIL - %d\n" : "SUCCESS\n", errno);
@@ -1724,8 +1732,6 @@ bool CommandShell::download_cmd(std::string& params, OutputStream& os)
         vTaskDelay(pdMS_TO_TICKS(1000));
     }
 
-    os.fast_capture_fnc = nullptr;
-
     return true;
 }
 
@@ -1735,6 +1741,11 @@ bool CommandShell::ry_cmd(std::string& params, OutputStream& os)
 
     if(is_busy()) {
         os.printf("FAIL - ymodem not allowed while printing or heaters are on\n");
+        return true;
+    }
+
+    if(os.capture_fnc != nullptr) {
+        os.puts("Something is already capturing input, exiting ymodem\n");
         return true;
     }
 
@@ -2147,6 +2158,11 @@ bool CommandShell::edit_cmd(std::string& params, OutputStream& os)
         return true;
     }
 
+    if(os.capture_fnc != nullptr) {
+        os.puts("Something is already capturing input exiting ed\n");
+        return true;
+    }
+
     std::string infile = stringutils::shift_parameter(params);
     std::string outfile = stringutils::shift_parameter(params);
 
@@ -2170,5 +2186,198 @@ bool CommandShell::edit_cmd(std::string& params, OutputStream& os)
         os.printf("edit failed\n");
     }
 
+    return true;
+}
+
+// routine to find the subroutine and return its list of lines
+static std::map<std::string, std::vector<std::string>> subroutines;
+static std::vector<std::string> *fetch_subroutine(std::string& nm)
+{
+    auto s = subroutines.find(nm);
+    if(s == subroutines.end()) {
+        return nullptr;
+    }
+    return &s->second;
+}
+
+// o like subroutines
+// main difference is only sub, endsub and call are supported
+// no parameters supported yet
+// there is a space between the o and the name
+// the name can be alphanumeric
+// this requires support in command_handler() to pass definitions onto this routine with the subdef sub-command
+bool CommandShell::subroutines_cmd(std::string& params, OutputStream& os)
+{
+    HELP("manage subroutines - o 100 [sub|endsub|call|list|save]");
+
+    std::string cmd = stringutils::shift_parameter(params);
+    if(cmd.empty()) {
+        os.printf("error:need a number or name\n");
+        os.set_no_response();
+        return true;
+    }
+
+    std::string name = cmd;
+
+    cmd = stringutils::shift_parameter(params);
+    if(cmd.empty()) {
+        os.printf("error:need one of sub, endsub, call, list or save\n");
+        os.set_no_response();
+        return true;
+    }
+
+    // executes a subroutine
+    if(cmd == "call") {
+        // find the subroutine
+        auto l = fetch_subroutine(name);
+        if(l == nullptr) {
+            os.printf("error: Subroutine %s is not defined\n", name.c_str());
+            os.set_no_response();
+            return true;
+        }
+
+        // execute the subroutine, we are in command thread context so dispatch the lines directly
+        static OutputStream nullos; // we don't want to get oks from these commands
+        for (auto& i : *l) {
+            dispatch_line(nullos, i.c_str());
+        }
+        return true;
+    }
+
+    // start a subroutine definition
+    if(cmd == "sub") {
+        if(!os.get_subroutine_def().empty()) {
+            os.printf("error: Already defining a Subroutine %s\n", name.c_str());
+            os.set_no_response();
+            return true;
+        }
+        // sets name of subroutine being defined
+        os.set_subroutine_def(name);
+
+        // define an empty subroutine (overwrites if already existing)
+        std::vector<std::string> lines;
+        // add subroutine to map
+        subroutines[name] = lines;
+        return true;
+    }
+
+    // adds lines to the current subroutine definition
+    if(cmd == "subdef") {
+        // internal command that saves the lines to the subroutine currently being defined
+        // find the subroutine
+        auto l = fetch_subroutine(name);
+        if(os.get_subroutine_def().empty() || l == nullptr) {
+            os.printf("error: Subroutine %s is not being defined\n", name.c_str());
+            return true;
+        }
+
+        if(!params.empty()) {
+            // save the rest of the line to the definition
+            l->push_back(params);
+            os.printf("ok - added line %d\n", l->size());
+        } else {
+            os.printf("ok - empty line discarded\n");
+        }
+        os.set_no_response();
+        return true;
+    }
+
+    // finishes a subroutine definition
+    if(cmd == "endsub") {
+        os.set_subroutine_def("");
+        os.printf("ok - ended sub %s\n", name.c_str());
+        os.set_no_response();
+        return true;
+    }
+
+    // non standard for dev purposes...
+
+    // list the lines in a subroutine
+    if(cmd == "list") {
+        // list the commands in the subroutine
+        // find the subroutine
+        auto l = fetch_subroutine(name);
+        if(l == nullptr) {
+            os.printf("error: Subroutine %s is not defined\n", name.c_str());
+            os.set_no_response();
+            return true;
+        }
+
+        for (auto& i : *l) {
+            os.printf("%s\n", i.c_str());
+        }
+        return true;
+    }
+
+    // save a subroutine to sdcard in a way it can loaded with play
+    if(cmd == "save") {
+        // save the commands in the subroutine
+        auto l = fetch_subroutine(name);
+        if(l == nullptr) {
+            os.printf("error: Subroutine %s is not defined\n", name.c_str());
+            os.set_no_response();
+            return true;
+        }
+        // file is named with a .sub extension
+        std::string fn(name);
+        fn.append(".").append("sub");
+        FILE *fp = fopen(fn.c_str(), "w");
+        if(fp == nullptr) {
+            os.printf("error: could not open file %s: %d\n", fn.c_str(), errno);
+            return true;
+        }
+
+        fprintf(fp, "o %s sub\n", name.c_str());
+        for (auto& i : *l) {
+            fprintf(fp, "%s\n", i.c_str());
+        }
+        fprintf(fp, "o %s endsub\n", name.c_str());
+        fclose(fp);
+        os.printf("ok - subroutine saved as %s\n", fn.c_str());
+        os.set_no_response();
+        return true;
+    }
+
+    os.printf("error: Unknown o command %s\n", cmd.c_str());
+    os.set_no_response();
+    return true;
+}
+
+bool CommandShell::line_editor_cmd(std::string& params, OutputStream& os)
+{
+    HELP("Enter line editor mode, exit with control-D (turn local echo off)");
+
+    if(os.capture_fnc != nullptr) {
+        os.puts("Something is already capturing input, exiting line edit mode\n");
+        return true;
+    }
+
+    // keeps a local history for this session only
+    LineEditor *line_editor = new LineEditor(&os);
+
+    // capture characters as they are input and pass onto line editor
+    // when eol is received dispatch the command
+    // NOTE this runs in a comms thread
+    OutputStream *pos = &os;
+    os.set_prompt("cmd> ");
+    os.capture_fnc = [line_editor, pos](char c) {
+        if(c == 4) { // exit capture and line edit mode
+            delete line_editor;
+            pos->capture_fnc = nullptr;
+            pos->puts("Exiting line edit mode\n");
+            pos->set_prompt("");
+            return;
+        }
+
+        if(line_editor->add(c)) { // returns false until eol is entered
+            char buf[256];
+            int n = line_editor->get_line(buf, sizeof(buf) - 1);
+            buf[n - 1] = 0;
+            send_message_queue(buf, pos);
+        }
+    };
+
+    os.puts("Entering line edit mode, control-D to exit\n");
+    // we return freeing up the command thread, the comms thread will handle the line input
     return true;
 }

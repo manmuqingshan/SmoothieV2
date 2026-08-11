@@ -123,7 +123,7 @@ bool dispatch_line(OutputStream& os, const char *ln)
             os.puts("ok\n");
         }
         os.set_no_response(false);
-
+        os.print_prompt();
         return true;
     }
 
@@ -183,6 +183,7 @@ bool dispatch_line(OutputStream& os, const char *ln)
     if(gcodes.empty()) {
         // if gcodes is empty then was a M110, just send ok
         os.puts("ok\n");
+        os.print_prompt();
         return true;
     }
 
@@ -258,6 +259,8 @@ bool dispatch_line(OutputStream& os, const char *ln)
         --ngcodes;
     }
 
+    os.print_prompt();
+
     return true;
 }
 
@@ -267,16 +270,17 @@ static std::set<OutputStream*> output_streams;
 // this is here so we do not need to duplicate this logic for
 // USB serial, UART serial, Network Shell, SDCard player thread
 // NOTE this can block if message queue is full. set wait to false to not wait at all
+// NOTE this is running in a comms thread
 bool process_command_buffer(size_t n, char *rx_buf, OutputStream *os, char *line, size_t& cnt, bool& discard, bool wait)
 {
     for (size_t i = 0; i < n; ++i) {
-        line[cnt] = rx_buf[i];
+        char c = rx_buf[i];
         if(os->capture_fnc) {
-            os->capture_fnc(line[cnt]);
+            os->capture_fnc(c);
             continue;
         }
 
-        if(line[cnt] == 24) { // ^X
+        if(c == 24) { // ^X
             if(!Module::is_halted()) {
                 Module::broadcast_halt(true);
                 print_to_all_consoles("ALARM: Abort during cycle\n");
@@ -284,7 +288,7 @@ bool process_command_buffer(size_t n, char *rx_buf, OutputStream *os, char *line
             discard = false;
             cnt = 0;
 
-        } else if(line[cnt] == 25) { // ^Y
+        } else if(c == 25) { // ^Y
             if(Module::is_halted()) {
                 // will also do what $X does
                 Module::broadcast_halt(false);
@@ -294,14 +298,14 @@ bool process_command_buffer(size_t n, char *rx_buf, OutputStream *os, char *line
                 os->set_stop_request(true);
             }
 
-        } else if(line[cnt] == '?') {
+        } else if(c == '?') {
             if(!queries.full()) {
                 queries.push_back({os, nullptr});
             }
 
         } else if(discard) {
             // we discard long lines until we get the newline
-            if(line[cnt] == '\n') discard = false;
+            if(c == '\n') discard = false;
 
         } else if(cnt >= MAX_LINE_LENGTH - 1) {
             // discard long lines
@@ -309,7 +313,7 @@ bool process_command_buffer(size_t n, char *rx_buf, OutputStream *os, char *line
             cnt = 0;
             os->puts("error:Discarding long line\n");
 
-        } else if(line[cnt] == '\n') {
+        } else if(c == '\n') {
             os->clear_flags(); // clear the done flag here to avoid race conditions
             line[cnt] = '\0'; // remove the \n and nul terminate
             if(cnt >= 2 && line[0] == '$' && (line[1] == 'I' || line[1] == 'S' || line[1] == 'X')) {
@@ -336,15 +340,15 @@ bool process_command_buffer(size_t n, char *rx_buf, OutputStream *os, char *line
             }
             cnt = 0;
 
-        } else if(line[cnt] == '\r') {
+        } else if(c == '\r') {
             // ignore CR
             continue;
 
-        } else if(line[cnt] == 8 || line[cnt] == 127) { // BS or DEL
+        } else if(c == 8 || c == 127) { // BS or DEL
             if(cnt > 0) --cnt;
 
         } else {
-            ++cnt;
+            line[cnt++] = c;
         }
     }
 
@@ -416,10 +420,12 @@ static void usb_comms(void *param)
                 if(os->fast_capture_fnc) {
                     if(!os->fast_capture_fnc(usb_rx_buf, n)) {
                         os->fast_capture_fnc = nullptr; // we are done ok
+                        // fall through to process as normal
+                    } else {
+                        continue;
                     }
-                } else {
-                    process_command_buffer(n, usb_rx_buf, os, line, cnt, discard);
                 }
+                process_command_buffer(n, usb_rx_buf, os, line, cnt, discard);
             }
 #if 1
             uint32_t db;
@@ -581,9 +587,27 @@ void command_handler()
         // This will timeout after 100 ms
         if(receive_message_queue(&line, &os)) {
             //printf("DEBUG: got line: %s\n", line);
-            dispatch_line(*os, line);
-            handle_query(false);
-            os->set_done(); // set after all possible output
+
+            // handle defining subroutines with o xxx sub
+            if(os->get_subroutine_def().empty()) {
+                // normal command
+                dispatch_line(*os, line);
+                handle_query(false);
+                os->set_done(); // set after all possible output
+
+            } else {
+                // we are defining a subroutine
+                if(strlen(line) >= 2 && line[0] == 'o' && line[1] == ' ') {
+                    // if it is an o command pass it along as is
+                    dispatch_line(*os, line);
+
+                }else{
+                    // so it can be processed we create an o xxx subdef restofline
+                    std::string cmd("o ");
+                    cmd.append(os->get_subroutine_def()).append(" subdef ").append(line);
+                    dispatch_line(*os, cmd.c_str());
+                }
+            }
 
         } else {
             // timed out or other error
@@ -628,6 +652,8 @@ void command_handler()
 // process things like instant query
 void safe_sleep(uint32_t ms)
 {
+    configASSERT(strncmp(pcTaskGetName(NULL), "CommandThread", configMAX_TASK_NAME_LEN - 1) == 0);
+
     // here we need to sleep (and yield) for 10ms then check if we need to handle the query command
     TickType_t delayms = pdMS_TO_TICKS(10); // 10 ms sleep
     while(ms > 0) {
